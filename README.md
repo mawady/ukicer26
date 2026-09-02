@@ -3,6 +3,7 @@
 [![UKICER 2026](https://img.shields.io/badge/UKICER-2026-blue)](https://ukicer.github.io/)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Ollama](https://img.shields.io/badge/LLM-Ollama-black)](https://ollama.com/)
+[![ChromaDB](https://img.shields.io/badge/RAG-ChromaDB-orange)](https://www.trychroma.com/)
 [![Streamlit](https://img.shields.io/badge/UI-Streamlit-red)](https://streamlit.io/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
@@ -230,7 +231,8 @@ uv pip install -r requirements.txt
 Run the Streamlit application from the repository root:
 
 ```bash
-uv run streamlit run src/app.py
+cs src
+uv run streamlit run app.py
 ```
 
 The application will open automatically in your browser.

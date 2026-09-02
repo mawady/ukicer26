@@ -2,32 +2,58 @@ import os
 import re
 from pathlib import Path
 from pypdf import PdfReader
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+
+import chromadb
+from chromadb import Documents, EmbeddingFunction, Embeddings
+from fastembed import TextEmbedding
+
+
+class FastEmbedEmbeddingFunction(EmbeddingFunction):
+    """Custom wrapper for FastEmbed to avoid ChromaDB import path mismatches."""
+
+    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
+        # FastEmbed manages ONNX runtime and lightweight embedding downloads (~130 MB)
+        self.model = TextEmbedding(model_name=model_name)
+
+    def __call__(self, input: Documents) -> Embeddings:
+        # Generates embedding vectors and converts numpy arrays to plain lists for ChromaDB
+        embeddings = self.model.embed(input)
+        return [e.tolist() for e in embeddings]
 
 
 class KnowledgeEngine:
-    def __init__(self):
-        # Local storage directory for indexed text chunks
-        self.storage_dir = Path("knowledge/index")
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_dir: str = "knowledge/chroma_db"):
+        self.db_dir = Path(db_dir)
+        self.db_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize lightweight ONNX embedding function
+        self.embedding_fn = FastEmbedEmbeddingFunction(
+            model_name="BAAI/bge-small-en-v1.5"
+        )
+
+        # Initialize persistent ChromaDB storage
+        self.client = chromadb.PersistentClient(path=str(self.db_dir))
+        self.collection = self.client.get_or_create_collection(
+            name="knowledge_base",
+            embedding_function=self.embedding_fn,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     def clear_cache(self) -> int:
-        """Deletes all cached index files inside the storage directory."""
-        deleted_count = 0
-        if self.storage_dir.exists():
-            for file_path in self.storage_dir.glob("*.txt"):
-                try:
-                    file_path.unlink()
-                    deleted_count += 1
-                except Exception as e:
-                    print(f"Error deleting cached file {file_path}: {e}")
-        return deleted_count
+        """Deletes all indexed vectors from the database."""
+        count = self.collection.count()
+        if count > 0:
+            self.client.delete_collection("knowledge_base")
+            self.collection = self.client.get_or_create_collection(
+                name="knowledge_base",
+                embedding_function=self.embedding_fn,
+                metadata={"hnsw:space": "cosine"},
+            )
+        return count
 
     @staticmethod
     def _is_useless_chunk(text: str, title: str) -> bool:
         """Filters out noise like Table of Contents, copyright notices, and generic boilerplate."""
-        text_lower = text.lower()
         title_lower = title.lower()
 
         # Ignore tiny chunks
@@ -41,14 +67,20 @@ class KnowledgeEngine:
 
         # Keyword filtering for administrative junk
         junk_keywords = [
-            "contents", "table of contents", "about this statement",
-            "relationship to legislation", "how can i use this document",
-            "copyright", "all rights reserved", "isbn", "published by"
+            "contents",
+            "table of contents",
+            "about this statement",
+            "relationship to legislation",
+            "how can i use this document",
+            "copyright",
+            "all rights reserved",
+            "isbn",
+            "published by",
         ]
         if any(keyword in title_lower for keyword in junk_keywords):
             return True
 
-        # Check for TOC-like structural density (e.g. lines ending with numbers)
+        # Check for TOC-like structural density (e.g., lines ending with page numbers)
         toc_line_matches = re.findall(r"\.\s*\d+$", text, flags=re.MULTILINE)
         if len(toc_line_matches) >= 2:
             return True
@@ -57,7 +89,7 @@ class KnowledgeEngine:
 
     @staticmethod
     def _clean_text(text: str) -> str:
-        """Sanitizes raw extracted text to remove junk characters, page numbers, and fix spacing."""
+        """Sanitizes raw extracted text to remove junk control characters and page headers."""
         if not text:
             return ""
         # Remove non-printable control characters
@@ -81,15 +113,36 @@ class KnowledgeEngine:
                 pages_text.append(extracted)
         return "\n".join(pages_text)
 
+    def _chunk_text(
+        self, text: str, max_chars: int = 1000, overlap: int = 150
+    ) -> list[str]:
+        """Splits document text into overlapping paragraph-aware windows."""
+        paragraphs = text.split("\n\n")
+        chunks = []
+        current_chunk = []
+        current_length = 0
+
+        for para in paragraphs:
+            if current_length + len(para) > max_chars:
+                if current_chunk:
+                    chunks.append("\n\n".join(current_chunk))
+                current_chunk = [para]
+                current_length = len(para)
+            else:
+                current_chunk.append(para)
+                current_length += len(para)
+
+        if current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+
+        return chunks
+
     def index_directory(self, folder_path: str, source_level: str) -> int:
         path = Path(folder_path)
-        path.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            return 0
 
-        chunks_indexed = 0
-        # Regex to detect meaningful document headings (e.g., '1 Context', '2 Subject Benchmark', 'Characteristics')
-        section_pattern = re.compile(
-            r"\n(?=(\d+(\.\d+)*\s+[A-Z][a-zA-Z\s,]+|Subject Benchmark|Characteristics of|Purposes of|Core Subjects|Course Content))"
-        )
+        documents, ids, metadatas = [], [], []
 
         for root, _, files in os.walk(path):
             for file_name in files:
@@ -101,111 +154,84 @@ class KnowledgeEngine:
                     if file_path.suffix.lower() == ".pdf":
                         raw_text = self._extract_raw_pdf_text(file_path)
                     else:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                        with open(
+                            file_path, "r", encoding="utf-8", errors="ignore"
+                        ) as f:
                             raw_text = f.read()
 
                     cleaned_text = self._clean_text(raw_text)
                     if not cleaned_text:
                         continue
 
-                    # Split document into distinct structural sections
-                    sections = section_pattern.split(cleaned_text)
-                    for idx, section in enumerate(sections):
-                        if not section or len(section.strip()) < 40:
+                    chunks = self._chunk_text(cleaned_text)
+
+                    for idx, chunk in enumerate(chunks):
+                        lines = [
+                            line.strip()
+                            for line in chunk.splitlines()
+                            if line.strip()
+                        ]
+                        section_title = (
+                            lines[0] if lines else "General Overview"
+                        )
+
+                        if self._is_useless_chunk(chunk, section_title):
                             continue
 
-                        section_text = self._clean_text(section)
-                        lines = [line.strip() for line in section_text.splitlines() if line.strip()]
-                        
-                        section_title = lines[0] if lines else "General Overview"
+                        doc_id = f"{source_level}_{file_path.stem}_{idx}"
 
-                        # Skip useless chunks (TOCs, page indexes, disclaimers)
-                        if self._is_useless_chunk(section_text, section_title):
-                            continue
-
-                        # Save clean, useful chunk
-                        out_file = self.storage_dir / f"{source_level}_{file_path.stem}_sec_{idx}.txt"
-                        with open(out_file, "w", encoding="utf-8") as out:
-                            out.write(f"SECTION: {section_title}\n{section_text}")
-
-                        chunks_indexed += 1
+                        documents.append(chunk)
+                        ids.append(doc_id)
+                        metadatas.append(
+                            {
+                                "source": file_path.name,
+                                "source_level": source_level,
+                                "section": section_title[:100],
+                            }
+                        )
 
                 except Exception as e:
                     print(f"Error indexing {file_name}: {e}")
 
-        return chunks_indexed
+        if documents:
+            # Upsert into vector store (handles batching internally)
+            self.collection.add(
+                documents=documents, ids=ids, metadatas=metadatas
+            )
 
-    def retrieve(self, query: str, top_k: int = 3) -> list:
-        """Ranks indexed section chunks using TF-IDF cosine similarity."""
-        if not self.storage_dir.exists():
+        return len(documents)
+
+    def retrieve(self, query: str, top_k: int = 3) -> list[dict]:
+        """Queries the vector database using FastEmbed semantic search."""
+        if self.collection.count() == 0:
             return []
 
-        file_paths = list(self.storage_dir.glob("*.txt"))
-        if not file_paths:
-            return []
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=top_k,
+            include=["documents", "metadatas", "distances"],
+        )
 
-        documents = []
-        metadata = []
+        formatted_results = []
+        if results and results["documents"]:
+            docs = results["documents"][0]
+            metas = results["metadatas"][0]
+            distances = results["distances"][0]
 
-        for file_path in file_paths:
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
+            for doc, meta, dist in zip(docs, metas, distances):
+                # Cosine distance to similarity conversion
+                score = round(1 - float(dist), 3)
 
-                if not content.strip():
-                    continue
+                # Similarity threshold (filters low confidence semantic matches)
+                if score >= 0.25:
+                    formatted_results.append(
+                        {
+                            "source": meta["source"],
+                            "source_level": meta["source_level"],
+                            "section": meta["section"],
+                            "content": doc[:800],
+                            "score": score,
+                        }
+                    )
 
-                parts = file_path.stem.split("_", 1)
-                level = parts[0] if len(parts) > 1 else "General"
-                doc_name = parts[1].split("_sec_")[0] if "_sec_" in parts[1] else parts[1]
-
-                lines = content.splitlines()
-                if lines and lines[0].startswith("SECTION:"):
-                    section_heading = lines[0].replace("SECTION:", "").strip()
-                    body_content = "\n".join(lines[1:]).strip()
-                else:
-                    section_heading = "General Overview"
-                    body_content = content.strip()
-
-                clean_body = self._clean_text(body_content)
-
-                # Skip chunk if recognized as noise
-                if self._is_useless_chunk(clean_body, section_heading):
-                    continue
-
-                documents.append(clean_body)
-                metadata.append({
-                    "source": f"{doc_name}.pdf" if "pdf" in doc_name.lower() or "sbs" in doc_name.lower() else doc_name,
-                    "source_level": level,
-                    "section": section_heading,
-                    "content": clean_body[:800]
-                })
-            except Exception:
-                continue
-
-        if not documents:
-            return []
-
-        # Calculate TF-IDF vector relevance scores
-        vectorizer = TfidfVectorizer(stop_words="english")
-        tfidf_matrix = vectorizer.fit_transform(documents + [query])
-
-        query_vec = tfidf_matrix[-1]
-        doc_vecs = tfidf_matrix[:-1]
-
-        similarities = cosine_similarity(query_vec, doc_vecs).flatten()
-
-        ranked_indices = similarities.argsort()[::-1]
-
-        results = []
-        for idx in ranked_indices[:top_k]:
-            if similarities[idx] > 0.05:  # Enforce minimum similarity threshold
-                item = metadata[idx]
-                item["score"] = round(float(similarities[idx]), 3)
-                results.append(item)
-
-        # Fallback to top metadata entries if no high-confidence TF-IDF matches occur
-        if not results:
-            results = metadata[:top_k]
-
-        return results
+        return formatted_results
