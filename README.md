@@ -322,7 +322,7 @@ The application can be configured to work with compatible models available throu
 For example:
 
 ```bash
-ollama pull gemma3
+ollama pull gemma4:e4b
 ```
 
 Other Ollama-compatible models can also be used depending on the available computational resources and application configuration.
